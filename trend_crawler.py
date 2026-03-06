@@ -31,8 +31,77 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def fetch_google_trends() -> list[dict]:
-    """Google Trends 일간 인기 검색어 (한국) RSS 피드에서 수집"""
+# ---------------------------------------------------------------------------
+# Google Trends
+# ---------------------------------------------------------------------------
+
+def _init_selenium_driver():
+    """Selenium headless Chrome 드라이버 생성"""
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--lang=ko-KR")
+
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
+
+
+def fetch_google_trends_selenium() -> list[dict]:
+    """Selenium으로 Google Trends 실시간 인기 검색어 수집 (최대 ~30개)"""
+    from selenium.webdriver.common.by import By
+
+    driver = _init_selenium_driver()
+    try:
+        driver.get("https://trends.google.co.kr/trending?geo=KR&hl=ko")
+        time.sleep(5)
+
+        # 스크롤하여 추가 항목 로드
+        for _ in range(3):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tr")
+        results = []
+        rank = 0
+        for row in rows:
+            cells = row.find_elements(By.CSS_SELECTOR, "td")
+            if len(cells) < 3:
+                continue
+            title = cells[1].text.strip()
+            traffic_raw = cells[2].text.strip()
+            if not title:
+                continue
+            # 검색량: "10만+\narrow_upward\n1,000%" -> 첫 줄만 추출
+            traffic = traffic_raw.split("\n")[0] if traffic_raw else ""
+            # 시작일 정보
+            started_raw = cells[3].text.strip() if len(cells) > 3 else ""
+            started = started_raw.split("\n")[0] if started_raw else ""
+            rank += 1
+            results.append({
+                "rank": rank,
+                "title": title,
+                "traffic": traffic,
+                "started": started,
+            })
+
+        logger.info("Google Trends (Selenium): %d개 키워드 수집 완료", len(results))
+        return results
+    except Exception as e:
+        logger.error("Google Trends Selenium 수집 실패: %s", e)
+        return []
+    finally:
+        driver.quit()
+
+
+def fetch_google_trends_rss() -> list[dict]:
+    """Google Trends RSS 피드 fallback (최대 10개)"""
     url = "https://trends.google.co.kr/trending/rss?geo=KR"
     try:
         feed = feedparser.parse(url)
@@ -45,18 +114,33 @@ def fetch_google_trends() -> list[dict]:
                 "link": entry.get("link", ""),
                 "published": entry.get("published", ""),
             })
-        logger.info("Google Trends: %d개 키워드 수집 완료", len(results))
+        logger.info("Google Trends (RSS fallback): %d개 키워드 수집 완료", len(results))
         return results
     except Exception as e:
-        logger.error("Google Trends 수집 실패: %s", e)
+        logger.error("Google Trends RSS 수집 실패: %s", e)
         return []
 
+
+def fetch_google_trends() -> list[dict]:
+    """Google Trends 수집 - Selenium 우선, 실패 시 RSS fallback"""
+    try:
+        results = fetch_google_trends_selenium()
+        if results:
+            return results
+    except Exception as e:
+        logger.warning("Selenium 사용 불가, RSS fallback 사용: %s", e)
+    return fetch_google_trends_rss()
+
+
+# ---------------------------------------------------------------------------
+# Naver Trends
+# ---------------------------------------------------------------------------
 
 def fetch_naver_datalab_shopping() -> dict:
     """Naver DataLab 쇼핑인사이트 - 분야별 인기 검색어 & 인기분야 수집"""
     base_headers = {**HEADERS, "Referer": "https://datalab.naver.com/"}
 
-    result = {"popular_categories": [], "category_keywords": {}}
+    result = {"popular_categories": [], "popular_keywords": [], "category_keywords": {}}
 
     # 1) 인기분야 랭킹
     try:
@@ -67,7 +151,6 @@ def fetch_naver_datalab_shopping() -> dict:
         )
         if resp.status_code == 200:
             data = resp.json()
-            # 여러 날짜의 데이터 중 가장 최신 것 선택
             if isinstance(data, list):
                 latest = data[-1] if data else {}
             else:
@@ -80,7 +163,28 @@ def fetch_naver_datalab_shopping() -> dict:
     except Exception as e:
         logger.warning("Naver 인기분야 수집 실패: %s", e)
 
-    # 2) 카테고리별 인기 검색어 (주요 카테고리)
+    # 2) 인기 검색어 (전체)
+    try:
+        resp = requests.get(
+            "https://datalab.naver.com/shoppingInsight/getKeywordRank.naver",
+            headers=base_headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                latest = data[-1] if data else {}
+            else:
+                latest = data
+            ranks = latest.get("ranks", [])
+            result["popular_keywords"] = [
+                {"rank": r["rank"], "keyword": r["keyword"]}
+                for r in ranks
+            ]
+    except Exception as e:
+        logger.warning("Naver 인기 검색어 수집 실패: %s", e)
+
+    # 3) 카테고리별 인기 검색어 (주요 카테고리)
     categories = {
         "50000000": "패션의류",
         "50000001": "패션잡화",
@@ -167,6 +271,7 @@ def fetch_naver_trends() -> dict:
 
         total = (
             len(shopping.get("popular_categories", []))
+            + len(shopping.get("popular_keywords", []))
             + sum(len(v) for v in shopping.get("category_keywords", {}).values())
             + len(page_keywords)
         )

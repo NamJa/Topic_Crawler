@@ -60,6 +60,17 @@ def json_to_markdown(data: dict) -> str:
             lines.append(f"| {item['rank']} | {item['keyword']} |")
         lines.append("")
 
+    # 인기 검색어 (전체)
+    pop_keywords = shopping.get("popular_keywords", [])
+    if pop_keywords:
+        lines.append("### 인기 검색어")
+        lines.append("")
+        lines.append("| 순위 | 키워드 |")
+        lines.append("|---:|:---|")
+        for item in pop_keywords:
+            lines.append(f"| {item['rank']} | {item['keyword']} |")
+        lines.append("")
+
     # 카테고리별 인기 검색어
     cat_keywords = shopping.get("category_keywords", {})
     if cat_keywords:
